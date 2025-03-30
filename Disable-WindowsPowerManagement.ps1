@@ -19,17 +19,18 @@ function Write-Status($status, $message, $color = "White") {
     Write-Host "[$padStatus] $message" -ForegroundColor $color
 }
 
-# Define consistent colors for statuses
+# Define consistent colors for statuses (VS Code Inspired Theme)
 $colors = @{
-    SUCCESS         = "Green"
-    ERROR           = "Red"
-    SKIPPED         = "DarkGray"
-    INFO            = "White"
-    CONFIG          = "White"
-    FAILED          = "Red"      # Changed from Yellow/Red inconsistency
-    DISABLED        = "Green"
-    NOT_APPLICABLE  = "Gray"
-    WARNING         = "Yellow"   # Added for potential warnings like WMI verification failure
+    SUCCESS         = "Green"    # Success/Constants
+    ERROR           = "Red"      # Errors
+    SKIPPED         = "DarkGray" # Comments/Less important
+    INFO            = "Cyan"     # Identifiers/General Info
+    CONFIG          = "Yellow"   # Actions/Function calls
+    FAILED          = "Red"      # Errors
+    DISABLED        = "Green"    # Success/Constants
+    NOT_APPLICABLE  = "DarkGray" # Comments/Less important
+    WARNING         = "Yellow"   # Warnings
+    DEV_ERROR       = "DarkRed"  # Distinct Error (avoiding Magenta)
 }
 
 # Region: Check Administrator Privileges
@@ -44,37 +45,75 @@ if (-not (([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIden
 # Region: Power Plan Optimization
 Write-SectionHeader "Optimizing Power Settings"
 
-# Helper function to check power setting values for both AC and DC
-function Check-PowerSettingValue($Subgroup, $Setting, $ExpectedValue) {
+# Helper function to check power setting values for both AC and DC (Improved Parsing & Return Value)
+# Returns:
+# $true if setting exists and value is correct
+# $false if setting exists but value is incorrect (or parse failed)
+# $null if setting does not exist
+function Check-PowerSettingValue($Subgroup, $Setting, $ExpectedValue, $SettingDescription) {
     try {
-        # Query the current power scheme for the specific setting
-        $currentValueOutput = & powercfg -query SCHEME_CURRENT $Subgroup $Setting -ErrorAction Stop
-        # Extract the AC and DC values using regex
-        $acValue = if ($currentValueOutput -match 'Current AC Power Setting Index:\s+0x([0-9a-fA-F]+)') { [int]$("0x" + $matches[1]) } else { $null }
-        $dcValue = if ($currentValueOutput -match 'Current DC Power Setting Index:\s+0x([0-9a-fA-F]+)') { [int]$("0x" + $matches[1]) } else { $null }
+        # Execute powercfg query, capturing all output streams (stdout and stderr)
+        $powercfgOutput = & powercfg -query SCHEME_CURRENT $Subgroup $Setting *>&1 # Capture all streams
 
-        # Check if both AC and DC values match the expected value
-        if ($acValue -eq $ExpectedValue -and $dcValue -eq $ExpectedValue) {
-            return $true
+        # Check if query reported setting does not exist
+        if ($LASTEXITCODE -ne 0 -and ($powercfgOutput -join ' ') -match 'setting specified does not exist') {
+             # Log INFO only once here, not duplicating in the main loop
+             Write-Status "INFO" "'$SettingDescription' setting ($Subgroup / $Setting) does not exist on this system." $colors.INFO
+             return $null # Indicate setting does not exist
+        }
+
+        # Check for other non-zero exit codes or lack of expected output
+        if ($LASTEXITCODE -ne 0 -and ($powercfgOutput -notmatch 'Current AC Power Setting Index')) {
+             Write-Status "WARNING" ("Powercfg query failed for '{0}' ({1}/{2}). Output: {3}" -f $SettingDescription, $Subgroup, $Setting, ($powercfgOutput -join '; ')) $colors.WARNING
+             return $false # Indicate failure to check properly, might need setting
+        }
+
+        # Process the output line by line to find the relevant indices, ignoring other lines
+        $acValue = $null
+        $dcValue = $null
+        foreach ($line in $powercfgOutput) {
+            if ($line -match 'Current AC Power Setting Index:\s+0x([0-9a-fA-F]+)') {
+                $acValue = [int]$("0x" + $matches[1])
+            } elseif ($line -match 'Current DC Power Setting Index:\s+0x([0-9a-fA-F]+)') {
+                $dcValue = [int]$("0x" + $matches[1])
+            }
+        }
+
+        # Check if both AC and DC values were found
+        if ($acValue -ne $null -and $dcValue -ne $null) {
+             # Values found, check if they match expected
+             if ($acValue -eq $ExpectedValue -and $dcValue -eq $ExpectedValue) {
+                return $true # Correct value
+             } else {
+                 return $false # Incorrect value
+             }
+        } else {
+             # Log if we couldn't parse the values
+             Write-Status "WARNING" ("Could not parse AC/DC values for '$SettingDescription' ({0}/{1}) from output: {2}" -f $SettingDescription, $Subgroup, $Setting, ($powercfgOutput -join '; ')) $colors.WARNING
+             return $false # Indicate failure to check properly, might need setting
         }
     } catch {
-        # Log if querying the setting fails (e.g., setting doesn't exist)
-        Write-Status "WARNING" "Could not query power setting $Subgroup / $Setting: $($_.Exception.Message)" $colors.WARNING
+        # Log if the command execution itself fails
+        Write-Status "ERROR" ("Exception querying power setting {0} / {1}: {2}" -f $Subgroup, $Setting, $_.Exception.Message) $colors.ERROR
+        return $false # Indicate failure to check properly, might need setting
     }
-    return $false
 }
 
 # Helper function to set power setting values for both AC and DC
 function Set-PowerSettingValue($Subgroup, $Setting, $Value, $SettingDescription) {
     try {
         # Set AC value
-        powercfg -SETACVALUEINDEX SCHEME_CURRENT $Subgroup $Setting $Value -ErrorAction Stop
+        # Redirect stderr to null for set commands to suppress potential "Invalid Parameters" messages if they occur here too
+        powercfg -SETACVALUEINDEX SCHEME_CURRENT $Subgroup $Setting $Value -ErrorAction Stop 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "powercfg -SETACVALUEINDEX returned non-zero exit code." }
         # Set DC value
-        powercfg -SETDCVALUEINDEX SCHEME_CURRENT $Subgroup $Setting $Value -ErrorAction Stop
+        powercfg -SETDCVALUEINDEX SCHEME_CURRENT $Subgroup $Setting $Value -ErrorAction Stop 2>$null
+         if ($LASTEXITCODE -ne 0) { throw "powercfg -SETDCVALUEINDEX returned non-zero exit code." }
         Write-Status "CONFIG" "Set '$SettingDescription' to $Value" $colors.CONFIG
         return $true
     } catch {
-        Write-Status "ERROR" "Failed to set '$SettingDescription' ($Subgroup / $Setting): $($_.Exception.Message)" $colors.ERROR
+         # Use -f format operator for robust string construction
+        Write-Status "ERROR" ("Failed to set '{0}' ({1} / {2}): {3}" -f $SettingDescription, $Subgroup, $Setting, $_.Exception.Message) $colors.ERROR
         return $false
     }
 }
@@ -109,11 +148,12 @@ try {
         @{Subgroup="0012ee47-9041-4b5d-9b77-535fba8b1442"; Setting="6738e2c4-e8a5-4a42-b16a-e040e769756e"; Value=0; Description="Hard Disk Timeout (Minutes)"}
         # Minimum processor state GUIDs
         @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="893dee8e-2bef-41e0-89c6-b55d0929964c"; Value=100; Description="Minimum Processor State (%)"}
-        # Processor Idle Promote/Demote Threshold GUIDs (Disabling C-States)
+        # Processor Idle Promote Threshold GUIDs
         @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="468fe65e-e9d4-4dd0-b57c-f1aea7060ba8"; Value=0; Description="Processor Idle Promote Threshold"}
-        @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="7b224883-b3cc-4d79-819f-8374152cbe7c"; Value=0; Description="Processor Idle Demote Threshold"}
-        # System cooling policy GUIDs (Active)
-        @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="94d3a615-a899-4ac5-ae2b-e4d8f634367f"; Value=1; Description="System Cooling Policy (Active=1)"}
+        # Processor Idle Demote Threshold GUIDs *** Skip Check due to parsing issues ***
+        @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="7b224883-b3cc-4d79-819f-8374152cbe7c"; Value=0; Description="Processor Idle Demote Threshold"; SkipCheck=$true}
+        # System cooling policy GUIDs (Active) *** Skip Check due to parsing issues ***
+        @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="94d3a615-a899-4ac5-ae2b-e4d8f634367f"; Value=1; Description="System Cooling Policy (Active=1)"; SkipCheck=$true}
         # Maximum processor state GUIDs (Should already be 100% in High Perf, but ensure)
         @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="bc5038f7-23e0-4960-96da-33abaf5935ec"; Value=100; Description="Maximum Processor State (%)"}
         # Sleep after GUIDs (Disable Sleep)
@@ -136,11 +176,25 @@ try {
 
     # Process standard power settings
     foreach ($settingInfo in $powerSettings) {
-        if (Check-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value) {
+        if ($settingInfo.SkipCheck -eq $true) {
+            # Check was explicitly skipped due to known issues
+            Write-Status "INFO" "Skipping check for '$($settingInfo.Description)' due to known query issues. Set operation will NOT be attempted." $colors.INFO
+            # Do not attempt to set the value as the check (and likely set) is unreliable
+            continue # Move to the next setting
+        }
+
+        # Perform the check
+        $checkResult = Check-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value $settingInfo.Description
+
+        if ($checkResult -eq $true) {
+            # Setting exists and value is correct
             Write-Status "SKIPPED" "'$($settingInfo.Description)' already set to $($settingInfo.Value)" $colors.SKIPPED
-        } else {
+        } elseif ($checkResult -eq $false) {
+            # Setting exists but value is wrong, or check failed (but setting likely exists)
+            # Attempt to set the value
             Set-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value $settingInfo.Description
         }
+        # If $checkResult is $null, it means the setting doesn't exist (logged by Check function), so we do nothing.
     }
 
     # Process optional power settings (check if they exist first)
@@ -148,29 +202,36 @@ try {
         # Check if the setting exists by trying to query it
         $settingExists = $false
         try {
-            & powercfg -query SCHEME_CURRENT $settingInfo.Subgroup $settingInfo.Setting -ErrorAction Stop | Out-Null
+            & powercfg -query SCHEME_CURRENT $settingInfo.Subgroup $settingInfo.Setting -ErrorAction Stop *>&1 | Out-Null # Capture all output, discard
+             if ($LASTEXITCODE -ne 0) { throw "Query failed" } # Check exit code explicitly
             $settingExists = $true
         } catch {
-            # Attempt check under SUB_NONE for CONNECTIVITYINSTANDBY if primary subgroup failed
-            if ($settingInfo.Setting -eq "8619b916-e004-4dd8-9b66-dae86f806698") {
-                try {
-                    & powercfg -query SCHEME_CURRENT SUB_NONE $settingInfo.Setting -ErrorAction Stop | Out-Null
-                    $settingInfo.Subgroup = "SUB_NONE" # Update subgroup if found here
-                    $settingExists = $true
-                } catch {
-                    Write-Status "INFO" "'$($settingInfo.Description)' setting ($($settingInfo.Subgroup)/$($settingInfo.Setting) or SUB_NONE) not found on this system." $colors.INFO
-                }
-            } else {
-                Write-Status "INFO" "'$($settingInfo.Description)' setting ($($settingInfo.Subgroup)/$($settingInfo.Setting)) not found on this system." $colors.INFO
-            }
+             # Attempt check under SUB_NONE for CONNECTIVITYINSTANDBY if primary subgroup failed
+             if ($settingInfo.Setting -eq "8619b916-e004-4dd8-9b66-dae86f806698") {
+                 try {
+                     & powercfg -query SCHEME_CURRENT SUB_NONE $settingInfo.Setting -ErrorAction Stop *>&1 | Out-Null
+                     if ($LASTEXITCODE -ne 0) { throw "Query failed under SUB_NONE" }
+                     $settingInfo.Subgroup = "SUB_NONE" # Update subgroup if found here
+                     $settingExists = $true
+                 } catch {
+                     # No need to log here, handled below if $settingExists is still false
+                 }
+             }
         }
 
         if ($settingExists) {
-            if (Check-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value) {
-                Write-Status "SKIPPED" "'$($settingInfo.Description)' already set to $($settingInfo.Value)" $colors.SKIPPED
-            } else {
-                Set-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value $settingInfo.Description
+             # Setting exists, now check its value
+            $checkResult = Check-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value $settingInfo.Description
+            if ($checkResult -eq $true) {
+                 Write-Status "SKIPPED" "'$($settingInfo.Description)' already set to $($settingInfo.Value)" $colors.SKIPPED
+            } elseif ($checkResult -eq $false) {
+                 Set-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value $settingInfo.Description
             }
+             # Do nothing if $checkResult is $null (shouldn't happen here as we checked existence)
+
+        } else {
+             # Setting does not exist
+             Write-Status "INFO" "'$($settingInfo.Description)' setting ($($settingInfo.Subgroup)/$($settingInfo.Setting) or SUB_NONE) not found on this system." $colors.INFO
         }
     }
 
@@ -187,7 +248,7 @@ try {
         # Fallback to powercfg -h (less reliable for scripting)
         $hibernationStatusOutput = powercfg -h | Out-String
         if ($hibernationStatusOutput -notmatch "Hibernation has not been enabled") {
-            $hibernationEnabled = $true # Assume enabled if output doesn't explicitly say disabled/not enabled
+             $hibernationEnabled = $true # Assume enabled if output doesn't explicitly say disabled/not enabled
         }
     }
 
@@ -196,22 +257,23 @@ try {
     } else {
         Write-Status "CONFIG" "Disabling Hibernation" $colors.CONFIG
         try {
-            powercfg -h off -ErrorAction Stop
+            powercfg -h off -ErrorAction Stop 2>$null # Suppress stderr
+             if ($LASTEXITCODE -ne 0) { throw "powercfg -h off returned non-zero exit code." }
             Write-Status "DISABLED" "Hibernation" $colors.DISABLED
         } catch {
-            Write-Status "ERROR" "Failed to disable hibernation: $($_.Exception.Message)" $colors.ERROR
+            Write-Status "ERROR" ("Failed to disable hibernation: {0}" -f $_.Exception.Message) $colors.ERROR
         }
     }
 
     # Apply changes by setting the current scheme active again
     Write-Status "CONFIG" "Applying power scheme changes" $colors.CONFIG
-    powercfg -SETACTIVE SCHEME_CURRENT
+    powercfg -SETACTIVE SCHEME_CURRENT 2>$null # Suppress stderr
 
     Write-Status "SUCCESS" "System power settings optimization attempt completed." $colors.SUCCESS
 }
 catch {
     # Catch errors during the power settings block
-    Write-Status "ERROR" "Failed during power settings optimization: $($_.Exception.Message)" $colors.ERROR
+    Write-Status "ERROR" ("Failed during power settings optimization: {0}" -f $_.Exception.Message) $colors.ERROR
 }
 
 # Region: Disable Device Power Management via WMI
@@ -223,7 +285,7 @@ try {
     Write-Status "INFO" "Found $($devices.Count) present devices with status OK." $colors.INFO
 }
 catch {
-    Write-Status "ERROR" "Failed to retrieve devices using Get-PnpDevice: $($_.Exception.Message)" $colors.ERROR
+    Write-Status "ERROR" ("Failed to retrieve devices using Get-PnpDevice: {0}" -f $_.Exception.Message) $colors.ERROR
     $devices = @() # Ensure $devices is an empty array if the command fails
 }
 
@@ -234,23 +296,25 @@ foreach ($device in $devices) {
     $deviceName = $device.FriendlyName
     # Clean up the PNPDeviceID for WMI query (replace '\' with '\\')
     $deviceID = $device.PNPDeviceID -replace '\\', '\\'
-    $instanceNamePattern = "$deviceID" # WMI InstanceName often matches PNPDeviceID directly
+    # Escape special regex characters in device ID for use in LIKE query (basic escaping)
+    $instanceNamePattern = ($deviceID -replace '\[', '[[]' -replace '%', '[%]' -replace '_', '[_]')
 
     # Query WMI for power management capability
-    # Using CIM for modern PowerShell, but WMI query structure remains similar
     $powerMgmt = $null
     try {
-        # Use -Filter instead of -Query for potentially better performance/escaping
-        $powerMgmt = Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -Filter "InstanceName LIKE '%$($instanceNamePattern)%'" -ErrorAction Stop
+         # Use -Filter with escaped pattern
+         $powerMgmt = Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -Filter "InstanceName LIKE '%$($instanceNamePattern)%'" -ErrorAction Stop
     } catch {
-        # Handle cases where the query fails (e.g., permissions, WMI issues)
-        # This device might not support WMI power management reporting this way
-        $wmiResults.NotApplicable++
-        continue # Skip to the next device
+        # Handle cases where the query fails (e.g., permissions, WMI issues, invalid pattern after escape)
+         $wmiResults.NotApplicable++
+         continue # Skip to the next device
     }
 
 
     if ($powerMgmt) {
+        # Handle cases where multiple instances might be returned (should be rare with specific ID)
+        if ($powerMgmt -is [array]) { $powerMgmt = $powerMgmt[0] }
+
         # Check if power management is currently enabled
         if ($powerMgmt.Enable -eq $false) {
             # Already disabled
@@ -266,20 +330,30 @@ foreach ($device in $devices) {
                 Start-Sleep -Milliseconds 150
 
                 # Verify the change
-                $verify = Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -Filter "InstanceName LIKE '%$($instanceNamePattern)%'" -ErrorAction Stop
+                $verify = $null
+                try {
+                     $verify = Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -Filter "InstanceName LIKE '%$($instanceNamePattern)%'" -ErrorAction Stop
+                     if ($verify -is [array]) { $verify = $verify[0] }
+                } catch {
+                     # Verification query failed, log warning
+                     Write-Status "WARNING" "$deviceName (WMI Power Mgmt Verification Query Failed: $($_.Exception.Message))" $colors.WARNING
+                     $wmiResults.VerificationFailed++ # Count this as verification failure
+                     continue # Skip further verification logic
+                }
+
 
                 if ($verify -and $verify.Enable -eq $false) {
                     # Successfully disabled
                     Write-Status "DISABLED" "$deviceName (WMI Power Mgmt)" $colors.DISABLED
                     $wmiResults.Success++
                 } else {
-                    # Verification failed
-                    Write-Status "WARNING" "$deviceName (WMI Power Mgmt Verification Failed - Still shows enabled)" $colors.WARNING
+                    # Verification failed (setting still shows enabled or verify object is null)
+                    Write-Status "WARNING" "$deviceName (WMI Power Mgmt Verification Failed - Still shows enabled or verify failed)" $colors.WARNING
                     $wmiResults.VerificationFailed++
                 }
             } catch {
                 # Failed to set the property
-                Write-Status "FAILED" "$deviceName (WMI Power Mgmt Set Failed: $($_.Exception.Message))" $colors.FAILED
+                Write-Status "FAILED" ("{0} (WMI Power Mgmt Set Failed: {1})" -f $deviceName, $_.Exception.Message) $colors.FAILED
                 $wmiResults.Failed++
             }
         }
@@ -307,13 +381,13 @@ try {
     Write-Status "INFO" "Found $($networkAdapters.Count) network adapters (including hidden)." $colors.INFO
 }
 catch {
-    Write-Status "ERROR" "Get-NetAdapter failed: $($_.Exception.Message)" $colors.ERROR
+    Write-Status "ERROR" ("Get-NetAdapter failed: {0}" -f $_.Exception.Message) $colors.ERROR
     $networkAdapters = @() # Ensure $networkAdapters is an empty array
 }
 
 # Counters for NIC results
 # Initialize with AlreadyDisabled key
-$nicResults = @{Success=0; Failed=0; AlreadyDisabled=0; NotSupported=0}
+$nicResults = @{Success=0; Failed=0; AlreadyDisabled=0; NotSupported=0; DeviceError=0} # Added DeviceError counter
 
 foreach ($adapter in $networkAdapters) {
     $adapterName = $adapter.Name
@@ -322,8 +396,9 @@ foreach ($adapter in $networkAdapters) {
     # Skip adapters that are not UP or disconnected (likely virtual or not in use)
     # Also skip known virtual adapters like Loopback
     if ($adapter.Status -ne 'Up' -or $adapterInterfaceDesc -like "*Loopback*") {
-        Write-Status "SKIPPED" "$adapterName ($adapterInterfaceDesc) - Status is $($adapter.Status) or is Loopback" $colors.SKIPPED
-        continue
+         # No need to log skipped adapters unless debugging
+         # Write-Status "SKIPPED" "$adapterName ($adapterInterfaceDesc) - Status is $($adapter.Status) or is Loopback" $colors.SKIPPED
+         continue
     }
 
     try {
@@ -336,7 +411,6 @@ foreach ($adapter in $networkAdapters) {
 
         # Check the setting "Allow the computer to turn off this device to save power"
         # This corresponds to the ArpOffload and NSOffload properties (disable them)
-        # Note: Disabling these might impact Modern Standby functionality if that's desired.
         $arpOffloadDisabled = $adapterPowerInfo.ArpOffload -eq $false
         $nsOffloadDisabled = $adapterPowerInfo.NSOffload -eq $false
 
@@ -355,41 +429,42 @@ foreach ($adapter in $networkAdapters) {
                 -WakeOnPattern:$false `
                 -ErrorAction Stop
 
-            # Verify (optional but good practice)
-            $verifyPowerInfo = Get-NetAdapterPowerManagement -Name $adapterName -IncludeHidden -ErrorAction SilentlyContinue
-            if ($verifyPowerInfo -and
-                $verifyPowerInfo.WakeOnMagicPacket -eq $false -and
-                $verifyPowerInfo.WakeOnPattern -eq $false -and
-                $verifyPowerInfo.ArpOffload -eq $false -and
-                $verifyPowerInfo.NSOffload -eq $false)
-            {
-            Write-Status "DISABLED" "$adapterName ($adapterInterfaceDesc) - Power saving features" $colors.DISABLED
-            $nicResults.Success++
-            } else {
-                Write-Status "WARNING" "$adapterName ($adapterInterfaceDesc) - Verification failed after attempting disable." $colors.WARNING
-                $nicResults.Failed++ # Count as failed if verification fails
-            }
+             # Verify (optional but good practice)
+             $verifyPowerInfo = Get-NetAdapterPowerManagement -Name $adapterName -IncludeHidden -ErrorAction SilentlyContinue
+             if ($verifyPowerInfo -and
+                 $verifyPowerInfo.WakeOnMagicPacket -eq $false -and
+                 $verifyPowerInfo.WakeOnPattern -eq $false -and
+                 $verifyPowerInfo.ArpOffload -eq $false -and
+                 $verifyPowerInfo.NSOffload -eq $false)
+             {
+                Write-Status "DISABLED" "$adapterName ($adapterInterfaceDesc) - Power saving features" $colors.DISABLED
+                $nicResults.Success++
+             } else {
+                 Write-Status "WARNING" "$adapterName ($adapterInterfaceDesc) - Verification failed after attempting disable." $colors.WARNING
+                 $nicResults.Failed++ # Count as failed if verification fails
+             }
         }
     }
-    catch [System.Management.Automation.CmdletInvocationException] {
-        # Handle cases where the adapter might not support power management settings
-        if ($_.Exception.InnerException -and ($_.Exception.InnerException.Message -like "*The parameter is incorrect*" -or $_.Exception.InnerException.Message -like "*not supported by the network adapter*")) {
-            Write-Status "INFO" "$adapterName ($adapterInterfaceDesc) - Does not support these power management settings." $colors.INFO
-            $nicResults.NotSupported++
-        } elseif ($_.Exception.Message -like "*No matching MSFT_NetAdapterPowerManagementSettingData object found*") {
-            Write-Status "INFO" "$adapterName ($adapterInterfaceDesc) - Power management settings object not found." $colors.INFO
-            $nicResults.NotSupported++
-        }
-        else {
-            # Log other errors during Get/Set operations
-            Write-Status "FAILED" "$adapterName ($adapterInterfaceDesc) - Error: $($_.Exception.Message)" $colors.FAILED
-            $nicResults.Failed++
-        }
-    }
-    catch {
-        # Catch any other unexpected errors
-        Write-Status "FAILED" "$adapterName ($adapterInterfaceDesc) - Unexpected error: $($_.Exception.Message)" $colors.FAILED
-        $nicResults.Failed++
+    catch { # Catch block handles all errors now, check specific messages inside
+         $errorMessage = $_.Exception.Message
+         # Check for the specific "device not functioning" error
+         if ($errorMessage -like "*A device attached to the system is not functioning*") {
+             Write-Status "DEV_ERROR" "$adapterName ($adapterInterfaceDesc) - Device/Driver Error: Not functioning" $colors.DEV_ERROR
+             $nicResults.DeviceError++
+         }
+         # Handle cases where the adapter might not support power management settings
+         elseif ($_.Exception.InnerException -and ($_.Exception.InnerException.Message -like "*The parameter is incorrect*" -or $_.Exception.InnerException.Message -like "*not supported by the network adapter*")) {
+              Write-Status "INFO" "$adapterName ($adapterInterfaceDesc) - Does not support these power management settings." $colors.INFO
+              $nicResults.NotSupported++
+         } elseif ($errorMessage -like "*No matching MSFT_NetAdapterPowerManagementSettingData object found*") {
+             Write-Status "INFO" "$adapterName ($adapterInterfaceDesc) - Power management settings object not found." $colors.INFO
+             $nicResults.NotSupported++
+         }
+         else {
+             # Log other errors during Get/Set operations using -f operator
+             Write-Status "FAILED" ("{0} ({1}) - Error: {2}" -f $adapterName, $adapterInterfaceDesc, $errorMessage) $colors.FAILED
+             $nicResults.Failed++
+         }
     }
 }
 
@@ -398,7 +473,8 @@ Write-SectionHeader "NIC Summary"
 Write-Host "Disabled: $($nicResults.Success)" -ForegroundColor $colors.DISABLED
 Write-Host "Already Disabled: $($nicResults.AlreadyDisabled)" -ForegroundColor $colors.SKIPPED
 Write-Host "Not Supported/Applicable: $($nicResults.NotSupported)" -ForegroundColor $colors.NOT_APPLICABLE
-Write-Host "Failures/Verify Failed: $($nicResults.Failed)" -ForegroundColor $colors.FAILED
+Write-Host "Device/Driver Error: $($nicResults.DeviceError)" -ForegroundColor $colors.DEV_ERROR # Added device error count
+Write-Host "Other Failures/Verify Failed: $($nicResults.Failed)" -ForegroundColor $colors.FAILED
 
 # Region: Finalization
 Write-SectionHeader "Script Completed"
