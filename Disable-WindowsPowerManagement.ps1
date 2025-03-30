@@ -1,277 +1,412 @@
 <#
 .SYNOPSIS
-Disables power management and Wake-on-LAN settings via WMI and NetAdapter cmdlets.
+Disables power management and Wake-on-LAN settings via WMI and NetAdapter cmdlets for maximum performance.
 #>
 
 # Region: Helper functions for clear, aesthetic output
 function Write-SectionHeader($Title) {
+    # Writes a formatted section header to the console.
+    # Cyan color is used for section titles for better visual separation.
     Write-Host "`n$(('-' * 5)) $Title $(('-' * (60 - $Title.Length)))" -ForegroundColor Cyan
 }
 
 function Write-Status($status, $message, $color = "White") {
-    $padStatus = $status.PadRight(9)
+    # Writes a status message with consistent padding and color.
+    # $status: The status keyword (e.g., SUCCESS, ERROR, SKIPPED).
+    # $message: The detailed message to display.
+    # $color: The foreground color for the message (defaults to White).
+    $padStatus = $status.PadRight(9) # Pad status for alignment
     Write-Host "[$padStatus] $message" -ForegroundColor $color
+}
+
+# Define consistent colors for statuses
+$colors = @{
+    SUCCESS         = "Green"
+    ERROR           = "Red"
+    SKIPPED         = "DarkGray"
+    INFO            = "White"
+    CONFIG          = "White"
+    FAILED          = "Red"      # Changed from Yellow/Red inconsistency
+    DISABLED        = "Green"
+    NOT_APPLICABLE  = "Gray"
+    WARNING         = "Yellow"   # Added for potential warnings like WMI verification failure
 }
 
 # Region: Check Administrator Privileges
 Write-SectionHeader "Privilege Check"
 if (-not (([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator"))) {
-    Write-Status "ERROR" "Administrator privileges required. Exiting." "Red"
+    Write-Status "ERROR" "Administrator privileges required. Exiting." $colors.ERROR
     exit 1
 } else {
-    Write-Status "SUCCESS" "Script running with Administrator privileges." "Green"
+    Write-Status "SUCCESS" "Script running with Administrator privileges." $colors.SUCCESS
 }
 
 # Region: Power Plan Optimization
 Write-SectionHeader "Optimizing Power Settings"
 
-# Add this helper function at the beginning to check power settings:
+# Helper function to check power setting values for both AC and DC
 function Check-PowerSettingValue($Subgroup, $Setting, $ExpectedValue) {
-    $currentValue = & powercfg -query SCHEME_CURRENT $Subgroup $Setting
-    if ($currentValue -match "Current AC Power Setting Index: $ExpectedValue" -and 
-        $currentValue -match "Current DC Power Setting Index: $ExpectedValue") {
-        return $true
+    try {
+        # Query the current power scheme for the specific setting
+        $currentValueOutput = & powercfg -query SCHEME_CURRENT $Subgroup $Setting -ErrorAction Stop
+        # Extract the AC and DC values using regex
+        $acValue = if ($currentValueOutput -match 'Current AC Power Setting Index:\s+0x([0-9a-fA-F]+)') { [int]$("0x" + $matches[1]) } else { $null }
+        $dcValue = if ($currentValueOutput -match 'Current DC Power Setting Index:\s+0x([0-9a-fA-F]+)') { [int]$("0x" + $matches[1]) } else { $null }
+
+        # Check if both AC and DC values match the expected value
+        if ($acValue -eq $ExpectedValue -and $dcValue -eq $ExpectedValue) {
+            return $true
+        }
+    } catch {
+        # Log if querying the setting fails (e.g., setting doesn't exist)
+        Write-Status "WARNING" "Could not query power setting $Subgroup / $Setting: $($_.Exception.Message)" $colors.WARNING
     }
     return $false
 }
 
+# Helper function to set power setting values for both AC and DC
+function Set-PowerSettingValue($Subgroup, $Setting, $Value, $SettingDescription) {
+    try {
+        # Set AC value
+        powercfg -SETACVALUEINDEX SCHEME_CURRENT $Subgroup $Setting $Value -ErrorAction Stop
+        # Set DC value
+        powercfg -SETDCVALUEINDEX SCHEME_CURRENT $Subgroup $Setting $Value -ErrorAction Stop
+        Write-Status "CONFIG" "Set '$SettingDescription' to $Value" $colors.CONFIG
+        return $true
+    } catch {
+        Write-Status "ERROR" "Failed to set '$SettingDescription' ($Subgroup / $Setting): $($_.Exception.Message)" $colors.ERROR
+        return $false
+    }
+}
+
 try {
     # Set High Performance mode
-    $currentScheme = powercfg -getactivescheme
-    if ($currentScheme -match "High performance") {
-        Write-Status "SKIPPED" "High Performance power mode already active" "DarkGray"
+    $currentSchemeOutput = powercfg -getactivescheme
+    # GUID for High Performance: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+    $highPerfGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+    if ($currentSchemeOutput -match $highPerfGuid) {
+        Write-Status "SKIPPED" "High Performance power plan already active" $colors.SKIPPED
     } else {
-        Write-Status "ENABLED" "High Performance power mode" "Green"
-        powercfg -setactive SCHEME_MIN
+        Write-Status "CONFIG" "Setting High Performance power plan" $colors.CONFIG
+        powercfg -setactive $highPerfGuid
+        # Verify change
+        $newSchemeOutput = powercfg -getactivescheme
+        if ($newSchemeOutput -match $highPerfGuid) {
+            Write-Status "SUCCESS" "Successfully set High Performance power plan" $colors.SUCCESS
+        } else {
+            Write-Status "ERROR" "Failed to set High Performance power plan" $colors.ERROR
+        }
     }
-    
-    # Disable USB Selective Suspend
-    if (Check-PowerSettingValue "2a737441-1930-4402-8d77-b2bebba308a3" "48e6b7a6-50f5-4782-a5d4-53bb8f07e226" 0) {
-        Write-Status "SKIPPED" "USB Selective Suspend already disabled" "DarkGray"
-    } else {
-        Write-Status "CONFIG" "Disabling USB Selective Suspend" "White"
-        powercfg -SETACVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
-        powercfg -SETDCVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
+
+    # Define power settings to configure [Subgroup Alias/GUID, Setting Alias/GUID, Expected Value, Description]
+    # Using GUIDs for reliability and language independence
+    $powerSettings = @(
+        # USB Selective Suspend Setting GUIDs
+        @{Subgroup="2a737441-1930-4402-8d77-b2bebba308a3"; Setting="48e6b7a6-50f5-4782-a5d4-53bb8f07e226"; Value=0; Description="USB Selective Suspend"}
+        # Link State Power Management GUIDs
+        @{Subgroup="ee12f906-d277-404b-b6da-e5fa1a576df5"; Setting="501a4d13-42af-4429-9fd1-a8218c268e20"; Value=0; Description="PCIe Link State Power Management"}
+        # Turn off hard disk after GUIDs
+        @{Subgroup="0012ee47-9041-4b5d-9b77-535fba8b1442"; Setting="6738e2c4-e8a5-4a42-b16a-e040e769756e"; Value=0; Description="Hard Disk Timeout (Minutes)"}
+        # Minimum processor state GUIDs
+        @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="893dee8e-2bef-41e0-89c6-b55d0929964c"; Value=100; Description="Minimum Processor State (%)"}
+        # Processor Idle Promote/Demote Threshold GUIDs (Disabling C-States)
+        @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="468fe65e-e9d4-4dd0-b57c-f1aea7060ba8"; Value=0; Description="Processor Idle Promote Threshold"}
+        @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="7b224883-b3cc-4d79-819f-8374152cbe7c"; Value=0; Description="Processor Idle Demote Threshold"}
+        # System cooling policy GUIDs (Active)
+        @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="94d3a615-a899-4ac5-ae2b-e4d8f634367f"; Value=1; Description="System Cooling Policy (Active=1)"}
+        # Maximum processor state GUIDs (Should already be 100% in High Perf, but ensure)
+        @{Subgroup="54533251-82be-4824-96c1-47b60b740d00"; Setting="bc5038f7-23e0-4960-96da-33abaf5935ec"; Value=100; Description="Maximum Processor State (%)"}
+        # Sleep after GUIDs (Disable Sleep)
+        @{Subgroup="238c9fa8-0aad-41ed-83f4-97be242c8f20"; Setting="29f6c1db-86da-48c5-9fdb-f2b67b1f44da"; Value=0; Description="Sleep After (Minutes)"}
+        # Allow hybrid sleep GUIDs (Disable)
+        @{Subgroup="238c9fa8-0aad-41ed-83f4-97be242c8f20"; Setting="94ac6d29-73ce-41a6-809f-6363ba21b47e"; Value=0; Description="Hybrid Sleep"}
+        # Allow wake timers GUIDs (Disable)
+        @{Subgroup="238c9fa8-0aad-41ed-83f4-97be242c8f20"; Setting="bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d"; Value=0; Description="Wake Timers"}
+        # Optional: Disable Display Timeout (Uncomment if needed)
+        # @{Subgroup="7516b95f-f776-4464-8c53-06167f40cc99"; Setting="3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e"; Value=0; Description="Display Off Timeout (Minutes)"}
+    )
+
+    # Settings that might not exist on all systems (Check existence before configuring)
+    $optionalPowerSettings = @(
+        # Network connectivity in Standby GUIDs (Modern Standby related)
+        @{Subgroup="f15576e8-98b7-4186-b944-eafa664402d9"; Setting="8619b916-e004-4dd8-9b66-dae86f806698"; Value=0; Description="Network connectivity in Standby"} # Check under SUB_NONE if Energy Saver subgroup doesn't exist
+        # GPU Preference Policy GUIDs
+        @{Subgroup="5fb4938d-1ee8-4b0f-9a3c-5036b0ab5c6c"; Setting="dd848b3a-b055-48f8-8218-86915500de77"; Value=1; Description="GPU Preference (High Performance=1)"}
+    )
+
+    # Process standard power settings
+    foreach ($settingInfo in $powerSettings) {
+        if (Check-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value) {
+            Write-Status "SKIPPED" "'$($settingInfo.Description)' already set to $($settingInfo.Value)" $colors.SKIPPED
+        } else {
+            Set-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value $settingInfo.Description
+        }
     }
-    
-    # Disable PCIe Link State Management
-    if (Check-PowerSettingValue "SUB_PCIEXPRESS" "ASPM" 0) {
-        Write-Status "SKIPPED" "PCIe Link State Management already disabled" "DarkGray"
-    } else {
-        Write-Status "CONFIG" "Disabling PCIe Link State Management" "White"
-        powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_PCIEXPRESS ASPM 0
-        powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_PCIEXPRESS ASPM 0
+
+    # Process optional power settings (check if they exist first)
+    foreach ($settingInfo in $optionalPowerSettings) {
+        # Check if the setting exists by trying to query it
+        $settingExists = $false
+        try {
+            & powercfg -query SCHEME_CURRENT $settingInfo.Subgroup $settingInfo.Setting -ErrorAction Stop | Out-Null
+            $settingExists = $true
+        } catch {
+            # Attempt check under SUB_NONE for CONNECTIVITYINSTANDBY if primary subgroup failed
+            if ($settingInfo.Setting -eq "8619b916-e004-4dd8-9b66-dae86f806698") {
+                try {
+                    & powercfg -query SCHEME_CURRENT SUB_NONE $settingInfo.Setting -ErrorAction Stop | Out-Null
+                    $settingInfo.Subgroup = "SUB_NONE" # Update subgroup if found here
+                    $settingExists = $true
+                } catch {
+                    Write-Status "INFO" "'$($settingInfo.Description)' setting ($($settingInfo.Subgroup)/$($settingInfo.Setting) or SUB_NONE) not found on this system." $colors.INFO
+                }
+            } else {
+                Write-Status "INFO" "'$($settingInfo.Description)' setting ($($settingInfo.Subgroup)/$($settingInfo.Setting)) not found on this system." $colors.INFO
+            }
+        }
+
+        if ($settingExists) {
+            if (Check-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value) {
+                Write-Status "SKIPPED" "'$($settingInfo.Description)' already set to $($settingInfo.Value)" $colors.SKIPPED
+            } else {
+                Set-PowerSettingValue $settingInfo.Subgroup $settingInfo.Setting $settingInfo.Value $settingInfo.Description
+            }
+        }
     }
-    
-    # Disable Disk Idle Timeout
-    if (Check-PowerSettingValue "SUB_DISK" "DISKIDLE" 0) {
-        Write-Status "SKIPPED" "Disk Idle Timeout already disabled" "DarkGray"
-    } else {
-        Write-Status "CONFIG" "Disabling Disk Idle Timeout" "White"
-        powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_DISK DISKIDLE 0
-        powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_DISK DISKIDLE 0
-    }
-    
-    # Set Minimum Processor State to 100%
-    if (Check-PowerSettingValue "SUB_PROCESSOR" "PROCTHROTTLEMIN" 100) {
-        Write-Status "SKIPPED" "Minimum Processor State already set to 100%" "DarkGray"
-    } else {
-        Write-Status "CONFIG" "Setting Minimum Processor State to 100%" "White"
-        powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100
-        powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100
-    }
-    
+
     # Disable Hibernation
-    $hibernationStatus = powercfg -h | Select-String -Pattern "Hibernation is disabled" -SimpleMatch
-    if ($hibernationStatus) {
-        Write-Status "SKIPPED" "Hibernation already disabled" "DarkGray"
-    } else {
-        Write-Status "DISABLED" "Hibernation" "Green"
-        powercfg -h off
+    $hibernationEnabled = $false
+    try {
+        # Check registry key HKLM:\SYSTEM\CurrentControlSet\Control\Power\HibernateEnabled
+        $hibernateRegValue = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Power" -Name "HibernateEnabled" -ErrorAction SilentlyContinue
+        if ($hibernateRegValue -and $hibernateRegValue.HibernateEnabled -eq 1) {
+            $hibernationEnabled = $true
+        }
+    } catch {
+        Write-Status "WARNING" "Could not check hibernation status via registry." $colors.WARNING
+        # Fallback to powercfg -h (less reliable for scripting)
+        $hibernationStatusOutput = powercfg -h | Out-String
+        if ($hibernationStatusOutput -notmatch "Hibernation has not been enabled") {
+            $hibernationEnabled = $true # Assume enabled if output doesn't explicitly say disabled/not enabled
+        }
     }
-    
-    # Optional: Disable Display Timeout
-    # Write-Status "CONFIG" "Disabling Display Timeout" "White"
-    # powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 0
-    # powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 0
-    
-    # NEW: Disable processor C-states (deeper sleep states)
-    Write-Status "CONFIG" "Disabling processor C-states (deeper sleep states)" "White"
-    powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR IDLEPROMOTE 0
-    powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR IDLEPROMOTE 0
-    powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR IDLEDEMOTE 0
-    powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR IDLEDEMOTE 0
-    
-    # NEW: Set processor cooling policy to active (performance over quiet)
-    Write-Status "CONFIG" "Setting processor cooling policy to active (performance)" "White"
-    powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR SYSCOOLPOL 1
-    powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR SYSCOOLPOL 1
-    
-    # NEW: Maximize processor performance state
-    Write-Status "CONFIG" "Maximizing processor performance state policies" "White"
-    powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR PERFINCPOL 2
-    powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR PERFINCPOL 2
-    powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR PERFDECPOL 1
-    powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_PROCESSOR PERFDECPOL 1
-    
-    # NEW: Disable sleep timeouts
-    Write-Status "CONFIG" "Disabling sleep timeouts" "White"
-    powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0
-    powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0
-    
-    # NEW: Disable hybrid sleep
-    Write-Status "CONFIG" "Disabling hybrid sleep" "White"
-    powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP HYBRIDSLEEP 0
-    powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP HYBRIDSLEEP 0
-    
-    # NEW: Disable wake timers
-    Write-Status "CONFIG" "Disabling wake timers" "White"
-    powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP RTCWAKE 0
-    powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP RTCWAKE 0
-    
-    # NEW: Disable connected standby (modern standby) - Only try if supported
-    Write-Status "CONFIG" "Disabling connected standby" "White"
-    $connectedStandbyCheck = powercfg -query SCHEME_CURRENT | Select-String -Pattern "Energy Saver"
-    if ($connectedStandbyCheck) {
-        powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_ENERGYSAVER ESPOLICY 0
-        powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_ENERGYSAVER ESPOLICY 0
-    } else {
 
-        Write-Status "SKIPPED" "Connected standby not supported on this system" "DarkGray"
-    }
-    
-    # NEW: Set GPU preference to high performance - Only try if supported 
-    Write-Status "CONFIG" "Setting GPU preference to high performance" "White"
-    $gpuCheck = powercfg -query SCHEME_CURRENT | Select-String -Pattern "Graphics"
-    if ($gpuCheck) {
-        # Use 1 instead of 2 as value - based on the error message
-        powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_GRAPHICS GPUPREFERENCEPOLICY 1 
-        powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_GRAPHICS GPUPREFERENCEPOLICY 1
+    if (-not $hibernationEnabled) {
+        Write-Status "SKIPPED" "Hibernation already disabled" $colors.SKIPPED
     } else {
-
-        Write-Status "SKIPPED" "GPU preference settings not supported on this system" "DarkGray"
+        Write-Status "CONFIG" "Disabling Hibernation" $colors.CONFIG
+        try {
+            powercfg -h off -ErrorAction Stop
+            Write-Status "DISABLED" "Hibernation" $colors.DISABLED
+        } catch {
+            Write-Status "ERROR" "Failed to disable hibernation: $($_.Exception.Message)" $colors.ERROR
+        }
     }
-    
-    # NEW: Prevent automatic network connectivity in standby - Only try if supported
-    Write-Status "CONFIG" "Disabling automatic network connectivity in standby" "White"
-    $networkStandbyCheck = powercfg -query SCHEME_CURRENT | Select-String -Pattern "Network connectivity in Standby"
-    if ($networkStandbyCheck) {
-        powercfg -SETACVALUEINDEX SCHEME_CURRENT SUB_NONE CONNECTIVITYINSTANDBY 0
-        powercfg -SETDCVALUEINDEX SCHEME_CURRENT SUB_NONE CONNECTIVITYINSTANDBY 0
-    } else {
 
-        Write-Status "SKIPPED" "Network standby settings not supported on this system" "DarkGray"
-    }
-    
-    # Apply changes
-    Write-Status "CONFIG" "Applying power scheme changes" "White"
+    # Apply changes by setting the current scheme active again
+    Write-Status "CONFIG" "Applying power scheme changes" $colors.CONFIG
     powercfg -SETACTIVE SCHEME_CURRENT
-    
-    Write-Status "SUCCESS" "System power settings optimized for maximum performance" "Green"
+
+    Write-Status "SUCCESS" "System power settings optimization attempt completed." $colors.SUCCESS
 }
 catch {
-    Write-Status "ERROR" "Failed to optimize power settings: $($_.Exception.Message)" "Red"
+    # Catch errors during the power settings block
+    Write-Status "ERROR" "Failed during power settings optimization: $($_.Exception.Message)" $colors.ERROR
 }
 
-# Region: Disable Power Management via WMI
+# Region: Disable Device Power Management via WMI
 Write-SectionHeader "Disabling Device Power Management (WMI)"
 
 try {
-    $devices = Get-PnpDevice | Where-Object { $_.Status -eq "OK" }
-    Write-Status "INFO" "Found $($devices.Count) devices with status OK." "White"
+    # Get Plug and Play devices that are currently present and OK
+    $devices = Get-PnpDevice | Where-Object { $_.Status -eq "OK" -and $_.Present -eq $true }
+    Write-Status "INFO" "Found $($devices.Count) present devices with status OK." $colors.INFO
 }
 catch {
-    Write-Status "ERROR" "Failed to retrieve devices: $($_.Exception.Message)" "Red"
-    $devices = @()
+    Write-Status "ERROR" "Failed to retrieve devices using Get-PnpDevice: $($_.Exception.Message)" $colors.ERROR
+    $devices = @() # Ensure $devices is an empty array if the command fails
 }
 
-# Counters
-$wmiResults = @{Success=0; AlreadyDisabled=0; Failed=0; NotApplicable=0}
+# Counters for WMI results
+$wmiResults = @{Success=0; AlreadyDisabled=0; Failed=0; NotApplicable=0; VerificationFailed=0}
 
 foreach ($device in $devices) {
     $deviceName = $device.FriendlyName
-    $deviceID = $device.PNPDeviceID
+    # Clean up the PNPDeviceID for WMI query (replace '\' with '\\')
+    $deviceID = $device.PNPDeviceID -replace '\\', '\\'
+    $instanceNamePattern = "$deviceID" # WMI InstanceName often matches PNPDeviceID directly
 
-    $wql = "SELECT * FROM MSPower_DeviceEnable WHERE InstanceName LIKE '%$([Regex]::Escape($deviceID))%'"
-    $powerMgmt = Get-CimInstance -Namespace root\wmi -Query $wql -ErrorAction SilentlyContinue
+    # Query WMI for power management capability
+    # Using CIM for modern PowerShell, but WMI query structure remains similar
+    $powerMgmt = $null
+    try {
+        # Use -Filter instead of -Query for potentially better performance/escaping
+        $powerMgmt = Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -Filter "InstanceName LIKE '%$($instanceNamePattern)%'" -ErrorAction Stop
+    } catch {
+        # Handle cases where the query fails (e.g., permissions, WMI issues)
+        # This device might not support WMI power management reporting this way
+        $wmiResults.NotApplicable++
+        continue # Skip to the next device
+    }
+
 
     if ($powerMgmt) {
+        # Check if power management is currently enabled
         if ($powerMgmt.Enable -eq $false) {
-            Write-Status "SKIPPED" "$deviceName (Already Disabled)" "DarkGray"
+            # Already disabled
+            Write-Status "SKIPPED" "$deviceName (WMI Power Mgmt Already Disabled)" $colors.SKIPPED
             $wmiResults.AlreadyDisabled++
         }
         else {
-            Set-CimInstance -InputObject $powerMgmt -Property @{Enable=$false} -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 100
-            $verify = Get-CimInstance -Namespace root\wmi -Query $wql -ErrorAction SilentlyContinue
+            # Attempt to disable power management
+            try {
+                # Use Set-CimInstance to modify the property
+                Set-CimInstance -InputObject $powerMgmt -Property @{Enable=$false} -ErrorAction Stop
+                # Short pause to allow change to apply
+                Start-Sleep -Milliseconds 150
 
-            if ($verify -and $verify.Enable -eq $false) {
-                Write-Status "DISABLED" "$deviceName" "Green"
-                $wmiResults.Success++
-            } else {
-                Write-Status "FAILED" "$deviceName (Verification Failed)" "Yellow"
+                # Verify the change
+                $verify = Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -Filter "InstanceName LIKE '%$($instanceNamePattern)%'" -ErrorAction Stop
+
+                if ($verify -and $verify.Enable -eq $false) {
+                    # Successfully disabled
+                    Write-Status "DISABLED" "$deviceName (WMI Power Mgmt)" $colors.DISABLED
+                    $wmiResults.Success++
+                } else {
+                    # Verification failed
+                    Write-Status "WARNING" "$deviceName (WMI Power Mgmt Verification Failed - Still shows enabled)" $colors.WARNING
+                    $wmiResults.VerificationFailed++
+                }
+            } catch {
+                # Failed to set the property
+                Write-Status "FAILED" "$deviceName (WMI Power Mgmt Set Failed: $($_.Exception.Message))" $colors.FAILED
                 $wmiResults.Failed++
             }
         }
     }
     else {
+        # No power management instance found for this device via this WMI class
         $wmiResults.NotApplicable++
     }
 }
 
 # WMI Summary
 Write-SectionHeader "WMI Summary"
-Write-Host "Disabled: $($wmiResults.Success)" -ForegroundColor Green
-Write-Host "Already Disabled: $($wmiResults.AlreadyDisabled)" -ForegroundColor DarkGray
-Write-Host "Not Applicable: $($wmiResults.NotApplicable)" -ForegroundColor Gray
-Write-Host "Failures: $($wmiResults.Failed)" -ForegroundColor Yellow
+Write-Host "Disabled: $($wmiResults.Success)" -ForegroundColor $colors.DISABLED
+Write-Host "Already Disabled: $($wmiResults.AlreadyDisabled)" -ForegroundColor $colors.SKIPPED
+Write-Host "Verification Failed: $($wmiResults.VerificationFailed)" -ForegroundColor $colors.WARNING # Using Warning color
+Write-Host "Set Failed: $($wmiResults.Failed)" -ForegroundColor $colors.FAILED
+Write-Host "Not Applicable/No WMI Control: $($wmiResults.NotApplicable)" -ForegroundColor $colors.NOT_APPLICABLE
 
-# Region: Disable NIC Power Management
-Write-SectionHeader "Disabling NIC Wake-on-LAN Features"
+# Region: Disable NIC Power Management & Wake Features
+Write-SectionHeader "Disabling NIC Power Management & Wake Features"
 
 try {
-    $networkAdapters = Get-NetAdapter -ErrorAction Stop
-    Write-Status "INFO" "Found $($networkAdapters.Count) network adapters." "White"
+    # Get all network adapters, including physical and virtual
+    $networkAdapters = Get-NetAdapter -IncludeHidden -ErrorAction Stop
+    Write-Status "INFO" "Found $($networkAdapters.Count) network adapters (including hidden)." $colors.INFO
 }
 catch {
-    Write-Status "ERROR" "Get-NetAdapter failed: $($_.Exception.Message)" "Red"
-    $networkAdapters = @()
+    Write-Status "ERROR" "Get-NetAdapter failed: $($_.Exception.Message)" $colors.ERROR
+    $networkAdapters = @() # Ensure $networkAdapters is an empty array
 }
 
-# Counters
-$nicResults = @{Success=0; Failed=0}
+# Counters for NIC results
+# Initialize with AlreadyDisabled key
+$nicResults = @{Success=0; Failed=0; AlreadyDisabled=0; NotSupported=0}
 
 foreach ($adapter in $networkAdapters) {
     $adapterName = $adapter.Name
+    $adapterInterfaceDesc = $adapter.InterfaceDescription
+
+    # Skip adapters that are not UP or disconnected (likely virtual or not in use)
+    # Also skip known virtual adapters like Loopback
+    if ($adapter.Status -ne 'Up' -or $adapterInterfaceDesc -like "*Loopback*") {
+        Write-Status "SKIPPED" "$adapterName ($adapterInterfaceDesc) - Status is $($adapter.Status) or is Loopback" $colors.SKIPPED
+        continue
+    }
+
     try {
-        $adapterPowerInfo = Get-NetAdapterPowerManagement -Name $adapterName -ErrorAction Stop
-        if ($adapterPowerInfo.WakeOnMagicPacket -eq "Disabled" -and $adapterPowerInfo.WakeOnPattern -eq "Disabled") {
-            Write-Status "SKIPPED" "$adapterName Wake-on-LAN features already disabled" "DarkGray"
-            $nicResults.AlreadyDisabled++  # Add this counter to the $nicResults hash table
+        # Check current power management settings for the adapter
+        $adapterPowerInfo = Get-NetAdapterPowerManagement -Name $adapterName -IncludeHidden -ErrorAction Stop
+
+        # Check specific Wake-on-LAN settings
+        $wolMagicPacketDisabled = $adapterPowerInfo.WakeOnMagicPacket -eq $false
+        $wolPatternDisabled = $adapterPowerInfo.WakeOnPattern -eq $false
+
+        # Check the setting "Allow the computer to turn off this device to save power"
+        # This corresponds to the ArpOffload and NSOffload properties (disable them)
+        # Note: Disabling these might impact Modern Standby functionality if that's desired.
+        $arpOffloadDisabled = $adapterPowerInfo.ArpOffload -eq $false
+        $nsOffloadDisabled = $adapterPowerInfo.NSOffload -eq $false
+
+        # Check if all relevant settings are already disabled
+        if ($wolMagicPacketDisabled -and $wolPatternDisabled -and $arpOffloadDisabled -and $nsOffloadDisabled) {
+            Write-Status "SKIPPED" "$adapterName ($adapterInterfaceDesc) - Power saving features already disabled" $colors.SKIPPED
+            $nicResults.AlreadyDisabled++
         } else {
-            Disable-NetAdapterPowerManagement -Name $adapterName -WakeOnPattern -WakeOnMagicPacket -Confirm:$false -ErrorAction Stop
-            Write-Status "DISABLED" "$adapterName Wake-on-LAN features" "Green"
+            # Disable the features
+            Write-Status "CONFIG" "Disabling Power saving features for $adapterName ($adapterInterfaceDesc)" $colors.CONFIG
+            # Use Set-NetAdapterPowerManagement for broader control
+            Set-NetAdapterPowerManagement -Name $adapterName -IncludeHidden `
+                -ArpOffload:$false `
+                -NSOffload:$false `
+                -WakeOnMagicPacket:$false `
+                -WakeOnPattern:$false `
+                -ErrorAction Stop
+
+            # Verify (optional but good practice)
+            $verifyPowerInfo = Get-NetAdapterPowerManagement -Name $adapterName -IncludeHidden -ErrorAction SilentlyContinue
+            if ($verifyPowerInfo -and
+                $verifyPowerInfo.WakeOnMagicPacket -eq $false -and
+                $verifyPowerInfo.WakeOnPattern -eq $false -and
+                $verifyPowerInfo.ArpOffload -eq $false -and
+                $verifyPowerInfo.NSOffload -eq $false)
+            {
+            Write-Status "DISABLED" "$adapterName ($adapterInterfaceDesc) - Power saving features" $colors.DISABLED
             $nicResults.Success++
+            } else {
+                Write-Status "WARNING" "$adapterName ($adapterInterfaceDesc) - Verification failed after attempting disable." $colors.WARNING
+                $nicResults.Failed++ # Count as failed if verification fails
+            }
+        }
+    }
+    catch [System.Management.Automation.CmdletInvocationException] {
+        # Handle cases where the adapter might not support power management settings
+        if ($_.Exception.InnerException -and ($_.Exception.InnerException.Message -like "*The parameter is incorrect*" -or $_.Exception.InnerException.Message -like "*not supported by the network adapter*")) {
+            Write-Status "INFO" "$adapterName ($adapterInterfaceDesc) - Does not support these power management settings." $colors.INFO
+            $nicResults.NotSupported++
+        } elseif ($_.Exception.Message -like "*No matching MSFT_NetAdapterPowerManagementSettingData object found*") {
+            Write-Status "INFO" "$adapterName ($adapterInterfaceDesc) - Power management settings object not found." $colors.INFO
+            $nicResults.NotSupported++
+        }
+        else {
+            # Log other errors during Get/Set operations
+            Write-Status "FAILED" "$adapterName ($adapterInterfaceDesc) - Error: $($_.Exception.Message)" $colors.FAILED
+            $nicResults.Failed++
         }
     }
     catch {
-        Write-Status "FAILED" "$adapterName ($($_.Exception.Message))" "Red"
+        # Catch any other unexpected errors
+        Write-Status "FAILED" "$adapterName ($adapterInterfaceDesc) - Unexpected error: $($_.Exception.Message)" $colors.FAILED
         $nicResults.Failed++
     }
 }
 
-# NIC Summary (update to include already disabled)
+# NIC Summary
 Write-SectionHeader "NIC Summary"
-Write-Host "Disabled: $($nicResults.Success)" -ForegroundColor Green
-Write-Host "Already Disabled: $($nicResults.AlreadyDisabled)" -ForegroundColor DarkGray
-Write-Host "Failures: $($nicResults.Failed)" -ForegroundColor Red
+Write-Host "Disabled: $($nicResults.Success)" -ForegroundColor $colors.DISABLED
+Write-Host "Already Disabled: $($nicResults.AlreadyDisabled)" -ForegroundColor $colors.SKIPPED
+Write-Host "Not Supported/Applicable: $($nicResults.NotSupported)" -ForegroundColor $colors.NOT_APPLICABLE
+Write-Host "Failures/Verify Failed: $($nicResults.Failed)" -ForegroundColor $colors.FAILED
 
 # Region: Finalization
 Write-SectionHeader "Script Completed"
-Write-Status "INFO" "All tasks completed." "White"
+Write-Status "INFO" "Power optimization script finished." $colors.INFO
 
-# Pause if run directly
+# Pause script execution if run directly in console for user to see output
 if ($Host.Name -eq 'ConsoleHost' -and -not $PSScriptRoot) {
     Write-Host "`nPress any key to exit..." -ForegroundColor Cyan
+    # Wait for a key press
     $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
 }
